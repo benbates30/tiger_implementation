@@ -1,2 +1,2 @@
-# tiger_implementation
-Un-official implementation of the Transformer Index for GEnerative Recommenders (TIGER) framework.
+# (WIP) TIGER Framework
+Un-official implementation (replication) of the Transformer Index for GEnerative Recommenders (TIGER) framework introduced in the Recommender Systems with Generative Retrieval paper. This is my first attempt to replicate a paper, is currently a work in progress, and will be updated throughout. The paper notes that their implementation, which used T5X for the transformer, will be released upon acceptance. That will be linked here, along with proper citation. For now, the pre-print is linked [here](https://shashankrajput.github.io/Generative.pdf). Note that I have no affiliation with this paper or its authors, and this is purely my interpretation and recreation attempt of what has been outlined in the pre-print.
