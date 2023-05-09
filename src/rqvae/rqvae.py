@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import numpy as np
 from typing import List, Dict
+from src.rqvae.kmeans import kmeans
 
 
 """
@@ -15,13 +16,17 @@ with a final latent representation dimension of 32.
 -  3 levels of residual quantization, seperate codebooks with cardinality of 256,
 each vector in codebook has dimensionality of 32
 
+- codebooks are learnable
+
 - Beta of 0.25 used for loss
 
 - Trained for 20k epochs, achieves >= 80% codebook usage. Adagrad Optimizer with lr=0.4.
 Batch size = 1024
 
-- To prevent codebook collapse, k-means clustering based initialization is used for the codebook.
+- DONE (Hacky embedding weight change): To prevent codebook collapse, k-means clustering based initialization is used for the codebook.
 k-means is applied on first training batch, with centroids used for initalization.
+# note that with this k means implementation the batch size must be larger than the code embedding dim
+in this case it is, with batch_size=1024, dim=32
 """
 
 class Encoder(nn.Module):
@@ -126,6 +131,8 @@ class VQEmbedding(nn.Embedding):
     def __init__(self,
                 n_embed: int,
                 embed_dim: int,
+                kmeans_init: bool = True,
+                kmeans_iters: int = 100,
                 ) -> None:
         
         super().__init__(n_embed + 1, embed_dim, padding_idx=n_embed)
@@ -133,6 +140,23 @@ class VQEmbedding(nn.Embedding):
         self.n_embed = n_embed
         self.embed_dim = embed_dim
 
+        self.init_fn = torch.ones if not kmeans_init else torch.zeros # change the torch.ones to something else
+        self.kmeans_iters = kmeans_iters
+
+        self.register_buffer("init_done", torch.tensor([not kmeans_init]))
+
+    @torch.jit.ignore
+    def _initialize_embeds(self, data):
+        if self.init_done:
+            return
+        
+        embeds = kmeans(data, n_clusters=self.n_embed, max_iter=self.kmeans_iters)
+        # hacky TODO: ensure works for computation graph properly -> more proper use
+        self.weight = nn.Parameter(torch.cat((embeds, torch.zeros(1, self.embed_dim)), dim=0))
+        self.init_done.data.copy_(torch.Tensor([True])) # set to true so only init once
+
+
+        
     @torch.no_grad()
     def compute_distances(self, inputs):
         # Inputs should be of shape [B, embed_dim]
@@ -159,6 +183,10 @@ class VQEmbedding(nn.Embedding):
         return embed_idxs
 
     def forward(self, inputs):
+
+        # initialize if not done so already, will only make alterations if kmeans init
+        self._initialize_embeds(inputs.squeeze(dim=1).detach().clone()) # squeeze TODO: cgeck with different shape
+
         embed_idxs = self.find_nearest_embedding(inputs)
 
         embeds = self.embed(embed_idxs)
@@ -181,7 +209,8 @@ class RQBottleneck(nn.Module):
                 num_codebooks: int,
                 embed_dim: int,
                 codebook_size: int,
-                shared_codebook: bool = False
+                shared_codebook: bool = False,
+                loss_beta: float = 0.25,
                 ) -> None:
         
         super().__init__()
@@ -191,6 +220,7 @@ class RQBottleneck(nn.Module):
         self.num_codebooks = num_codebooks
         self.embed_dim = embed_dim
         self.shared_codebook = shared_codebook
+        self.loss_beta = loss_beta
 
         self.codebook_size = [codebook_size for _ in range(self.num_codebooks)] # all codebooks are same size
 
@@ -229,6 +259,7 @@ class RQBottleneck(nn.Module):
 
         quant_embeds = []
         codes = []
+        residuals = []
         agg_quants = torch.zeros_like(x)
 
         for i in range(self.num_codebooks):
@@ -239,16 +270,35 @@ class RQBottleneck(nn.Module):
 
             codes.append(code.unsqueeze(dim=-1))
             quant_embeds.append(agg_quants.clone()) # check this
+            residuals.append(residual_feature.clone())
 
 
         codes = torch.cat(codes, dim=-1)
-        return quant_embeds, codes
+        return quant_embeds, codes, residuals
     
 
     def forward(self, x):
-        quant_embeds, codes = self.quantize(x)
+        quant_embeds, codes, residuals = self.quantize(x)
         # truncating for embeds here?
-        return quant_embeds, codes
+        rqvae_loss = self.rqvae_loss(quant_embeds, residuals)
+        return quant_embeds, codes, rqvae_loss
+    
+    def rqvae_loss(self, quant_embeds, residuals):
+
+        loss_list = []
+        for idx, quant in enumerate(quant_embeds):
+            # need to get residuals here to use
+            loss1 = (residuals[idx].detach() - quant).pow(2.0).mean()
+            loss2 = (residuals[idx] - quant.detach()).pow(2.0).mean()
+            partial_loss = loss1 + self.loss_beta * loss2
+            loss_list.append(partial_loss)
+        
+        rqvae_loss = torch.sum(torch.stack(loss_list)) # TODO: check this and loss overall
+        return rqvae_loss
+
+
+
+
 
 
 
@@ -287,9 +337,9 @@ class RQVAE(nn.Module):
     
     def forward(self, xs):
         z_e = self.encode(xs)
-        z_q, codes = self.rquant(z_e)
+        z_q, codes, quant_loss = self.rquant(z_e)
         out = self.decode(z_q)
-        return out, codes
+        return out, codes, quant_loss
 
 
     def encode(self, x):
@@ -303,6 +353,16 @@ class RQVAE(nn.Module):
             z_q = z_q[-1]
         out = self.decoder(z_q)
         return out
+    
+    def compute_loss(self, out, xs, quant_loss,):
+        recon_loss = F.mse_loss(out, xs, reduction="mean") # reconstructuion loss
+
+        rqvae_loss = quant_loss
+
+        total_loss = recon_loss + rqvae_loss
+
+        return total_loss, recon_loss, rqvae_loss
+
         
 
 
@@ -328,15 +388,17 @@ if __name__ == "__main__":
     """
     VQ Embedding tests
     """
-    # inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87]])
+    # inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87],
+    #                        [0.2, 0.4, -0.4, -0.3, 0.0]])
     # # Initiaization functions properly, including padding
     # # can also retrieve embeddings correctly
-    # embed_table = VQEmbedding(10, 5) # 10 embeedings of dimension 5
+    # embed_table = VQEmbedding(2, 5) # 10 embeedings of dimension 5
     # print(embed_table)
-    # all_embedddings = embed_table.embed(torch.tensor([i for i in range(11)])) # viewing all the embeddings
+    # all_embedddings = embed_table.embed(torch.tensor([i for i in range(3)])) # viewing all the embeddings
     # print(all_embedddings)
 
     # # forward pass functions.
+    # print("forward pass VQ Embedding")
     # embeds, embed_idxs = embed_table(inputs)
     # print(embed_idxs)
     # print(embeds)
@@ -345,23 +407,26 @@ if __name__ == "__main__":
     RQ bottleneck tests
     """
     # inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87]])
-    # # initalizes properly
-    # rq = RQBottleneck(3, 5, 12)
-    # print(rq)
-    # # quantizes properly (at least visually)
-    # quant_embeds, codes = rq.quantize(inputs)
-    # print(codes)
-    # print(quant_embeds)
+    inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87],
+                           [0.2, 0.4, -0.4, -0.3, 0.0]])
+    # initalizes properly
+    rq = RQBottleneck(3, 5, 2)
+    print(rq)
+    # quantizes properly (at least visually)
+    quant_embeds, codes, quant_loss = rq.quantize(inputs)
+    print(codes)
+    print(quant_embeds)
 
     """
     RQ-VAE tests
     """
-    inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87]])
-
-    vae = RQVAE(3, 13, 5, 2, [4, 3])
-    print(vae)
-    out = vae(inputs)
-    print(out)
+    # inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87]])
+    # inputs = torch.tensor([[0.04, 0.96, -0.43, -0.65, 0.46], [0.69, -0.34, -0.12, 0.54, -0.87],
+    #                        [0.2, 0.4, -0.4, -0.3, 0.0]])
+    # vae = RQVAE(3, 13, 5, 2, [4, 3])
+    # print(vae)
+    # out = vae(inputs)
+    # print(out)
 
    
 
