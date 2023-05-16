@@ -151,7 +151,6 @@ class VQEmbedding(nn.Embedding):
             return
         
         embeds = kmeans(data, n_clusters=self.n_embed, max_iter=self.kmeans_iters)
-        # hacky TODO: ensure works for computation graph properly -> more proper use
         self.weight = nn.Parameter(torch.cat((embeds, torch.zeros(1, self.embed_dim)), dim=0))
         self.init_done.data.copy_(torch.Tensor([True])) # set to true so only init once
 
@@ -185,7 +184,7 @@ class VQEmbedding(nn.Embedding):
     def forward(self, inputs):
 
         # initialize if not done so already, will only make alterations if kmeans init
-        self._initialize_embeds(inputs.squeeze(dim=1).detach().clone()) # squeeze TODO: cgeck with different shape
+        self._initialize_embeds(inputs.squeeze(dim=1).detach().clone())
 
         embed_idxs = self.find_nearest_embedding(inputs)
 
@@ -214,8 +213,6 @@ class RQBottleneck(nn.Module):
                 ) -> None:
         
         super().__init__()
-
-        # TODO: check embed dim done properly
 
         self.num_codebooks = num_codebooks
         self.embed_dim = embed_dim
@@ -293,7 +290,7 @@ class RQBottleneck(nn.Module):
             partial_loss = loss1 + self.loss_beta * loss2
             loss_list.append(partial_loss)
         
-        rqvae_loss = torch.sum(torch.stack(loss_list)) # TODO: check this and loss overall
+        rqvae_loss = torch.sum(torch.stack(loss_list))
         return rqvae_loss
 
 
