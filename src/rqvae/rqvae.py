@@ -359,6 +359,12 @@ class RQVAE(nn.Module):
         total_loss = recon_loss + rqvae_loss
 
         return total_loss, recon_loss, rqvae_loss
+    
+    def get_codes(self, xs):
+        z_e = self.encode(xs)
+        z_q, codes, quant_loss = self.rquant(z_e)
+        return codes
+
 
         
 
