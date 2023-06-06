@@ -23,7 +23,7 @@ each vector in codebook has dimensionality of 32
 - Trained for 20k epochs, achieves >= 80% codebook usage. Adagrad Optimizer with lr=0.4.
 Batch size = 1024
 
-- DONE (Hacky embedding weight change): To prevent codebook collapse, k-means clustering based initialization is used for the codebook.
+-To prevent codebook collapse, k-means clustering based initialization is used for the codebook.
 k-means is applied on first training batch, with centroids used for initalization.
 # note that with this k means implementation the batch size must be larger than the code embedding dim
 in this case it is, with batch_size=1024, dim=32
@@ -260,7 +260,7 @@ class RQBottleneck(nn.Module):
         agg_quants = torch.zeros_like(x)
 
         for i in range(self.num_codebooks):
-            quant_emb, code = self.codebooks[0](residual_feature)
+            quant_emb, code = self.codebooks[i](residual_feature)
 
             residual_feature.sub_(quant_emb) # r[d] = r[d-1] - e(k[d]) 
             agg_quants.add_(quant_emb) # z^d = sum(i=1->d) e(k[i]) // we're adding this embed to the sum

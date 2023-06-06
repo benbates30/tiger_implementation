@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.optim import Adagrad
 from torch.utils.data import DataLoader
-from embedding_dataset import EmbeddingDataset
+from src.datasets.embedding_dataset import EmbeddingDataset
 
 """
 Trained for 20k epochs, achieves >= 80% codebook usage. Adagrad Optimizer with lr=0.4.

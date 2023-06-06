@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
-from embedding_dataset import EmbeddingDataset
-from seq_dataset import SeqDataset
+from src.datasets.embedding_dataset import EmbeddingDataset
+from src.datasets.seq_dataset import SeqDataset
 from src.rqvae.rqvae import RQVAE
 import numpy as np
 
