@@ -52,26 +52,32 @@ class LayerNorm(nn.Module):
     def forward(self, input: Tensor,) -> Tensor:
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+
 class MLP(nn.Module):
-    """
-    MLP
-    """
+
     def __init__(self,
-                input_dim: int,
                 embed_dim: int,
+                ff_dim: int,
                 dropout: float) -> None:
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, input_dim),
-            nn.Dropout(dropout)
-        )
+                nn.Linear(embed_dim, ff_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(ff_dim, embed_dim),
+            )
+        self.t5_layer_norm = LayerNorm(embed_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     
     def forward(self,
-            x: Tensor) -> Tensor:
-        return self.net(x)
+            xs: Tensor) -> Tensor:
+        xs_norm = self.t5_layer_norm(xs)
+        ys = self.net(xs)
+        output = xs + self.dropout(ys)
+        return output
 
 
 class SelfAttention(nn.Module):
@@ -88,47 +94,56 @@ class SelfAttention(nn.Module):
         self.dim_head = dim_head
         self.inner_dim = dim_head * num_heads
 
+
         self.key = nn.Linear(input_dim, self.inner_dim, bias=False)
         self.query = nn.Linear(input_dim, self.inner_dim, bias=False)
         self.value = nn.Linear(input_dim, self.inner_dim, bias=False)
         self.proj_out = nn.Linear(self.inner_dim, input_dim)
 
+
+
+
+        # self.rel_pos_bias = 5 # TODO: rel posiiton bias
+
         self.dropout = nn.Dropout(dropout)
 
         
 
-
-
-
-
     def forward(self, x: Tensor, mask=None) -> Tensor:
-        # mask decides wether to mask the attention (e.g. masking to only prev for decoder)
+        # mask decides how to mask the attention
 
         B, T, C = x.size()
 
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
+        def _reshape(xs):
+            return xs.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
 
-        # moving head to batch dim
-        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        def _unshape(self, xs):
+            return xs.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        q = _reshape(self.query(x))
+        k = _reshape(self.key(x))
+        v = _reshape(self.value(x))
+
 
         q = q * self.dim_head**-0.5
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        score = torch.einsum('b h i d, b h j d -> b h i j', q, k)
+
+        score = self.rel_pos_bias(score)
+
+        mask_value = -torch.finfo(score.dtype).max
+
         if mask is not None:
-            att = att.masked_fill(mask == 0, float('-inf'))
-
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            score = score.masked_fill_(~mask, mask_value)
 
 
+        attn = F.softmax(score, dim=-1)
+        attn = self.dropout(attn)
 
+        # aggregate
+
+        y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = _reshape(y) # re-assemble all head outputs side by side
 
         return self.proj_out(y) # project back to output embedding dim
 
@@ -139,12 +154,72 @@ class SelfAttention(nn.Module):
 class CrossAttention(nn.Module):
 
     def __init__(self,
-                input_dim: int) -> None:
+                input_dim: int,
+                num_heads: int,
+                dim_head: int,
+                dropout: float,
+                context_dim: int = None,
+                ) -> None:
         super().__init__()
 
+        self.num_heads = num_heads
+        self.dim_head = dim_head
+        self.inner_dim = dim_head * num_heads
 
-    def forward(self, x: Tensor) -> Tensor:
-        pass
+        if context_dim is None:
+            context_dim = input_dim
+
+        self.key = nn.Linear(input_dim, self.inner_dim, bias=False)
+        self.query = nn.Linear(input_dim, self.inner_dim, bias=False)
+        self.value = nn.Linear(input_dim, self.inner_dim, bias=False)
+        self.proj_out = nn.Linear(self.inner_dim, input_dim, )
+
+        self.dropout = nn.Dropout(dropout)
+        
+
+
+    def forward(self, x: Tensor, context: Tensor, mask=None, context_mask=None) -> Tensor:
+        
+        B, T, C = x.size()
+
+        if context is None:
+            past_key_value_states = x
+        else:
+            past_key_value_states = context
+
+        def _reshape(xs):
+            return xs.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+
+        def _unshape(self, xs):
+            return xs.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        q = _reshape(self.query(x))
+        k = _reshape(self.key(x))
+        v = _reshape(self.value(x))
+
+
+        q = q * self.dim_head**-0.5
+
+        score = torch.einsum('b h i d, b h j d -> b h i j', q, k)
+
+        mask_value = -torch.finfo(score.dtype).max
+
+        if mask is not None:
+            score = score.masked_fill_(~mask, mask_value)
+
+        if context_mask is not None:
+            score = score.masked_fill_(~context_mask[:, None, :], mask_value)
+
+        attn = F.softmax(score, dim=-1)
+        attn = self.dropout(attn)
+
+        # aggregate
+
+        y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = _reshape(y) # re-assemble all head outputs side by side
+
+        return self.proj_out(y) # project back to output embedding dim
+
 
 class EncoderBlock(nn.Module):
     def __init__(self,
@@ -160,11 +235,11 @@ class EncoderBlock(nn.Module):
         self.attention = SelfAttention(input_dim=embed_dim, num_heads=num_heads, 
                                        dim_head=dim_head, dropout=dropout)
         self.ln2 = LayerNorm(embed_dim, bias=False)
-        self.mlp = MLP(input_dim=embed_dim, embed_dim=mlp_dim, dropout=dropout)
+        self.mlp = MLP(embed_dim=embed_dim, ff_dim=mlp_dim, dropout=dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask=None) -> Tensor:
         # residual connections included
-        x = x + self.attention(self.ln1(x))
+        x = x + self.attention(self.ln1(x), mask=mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -194,10 +269,10 @@ class Encoder(nn.Module):
                                                   dropout=dropout) for _ in range(num_layers)])
 
     
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask=None) -> Tensor:
         x = self.tok_embed(x)
         for encoder_block in self.layers:
-            x = encoder_block(x)
+            x = encoder_block(x, mask=mask)
         return self.output_norm(x)
     
 
@@ -217,14 +292,14 @@ class DecoderBlock(nn.Module):
         self.self_attention = SelfAttention(input_dim=embed_dim, num_heads=num_heads, 
                                             dim_head=dim_head, dropout=dropout)
         self.ln2 = LayerNorm(embed_dim, bias=False)
-        self.cross_attention = CrossAttention()
+        self.cross_attention = CrossAttention(embed_dim, num_heads, dim_head, dropout, )
         self.ln3 = LayerNorm(embed_dim, bias=False)
-        self.mlp = MLP(input_dim=embed_dim, embed_dim=mlp_dim, dropout=dropout)
+        self.mlp = MLP(embed_dim=embed_dim, ff_dim=mlp_dim, dropout=dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, context:Tensor, mask=None, context_mask=None) -> Tensor:
         # includes residual connections
-        x = x + self.self_attention(self.ln1(x))
-        x = x + self.cross_attention(self.ln2(x))
+        x = x + self.self_attention(self.ln1(x), mask=mask)
+        x = x + self.cross_attention(self.ln2(x), context=context, mask=mask, context_mask=context_mask)
         x = x + self.mlp(self.ln3(x))
         
         return x
@@ -256,17 +331,17 @@ class Decoder(nn.Module):
                                                   dim_head=dim_head,
                                                   mlp_dim=mlp_dim,
                                                   dropout=dropout) for _ in range(num_layers)])
-
         
-    def forward(self, x: Tensor) -> Tensor:
+        
+    def forward(self, x: Tensor, context:Tensor,  mask=None, context_mask=None) -> Tensor:
         x = self.tok_embed(x)
         for decoder_block in self.layers:
-            x = decoder_block(x)
+            x = decoder_block(x, context=context, mask=mask, context_mask=context_mask)
 
         return self.output_norm(x)
 
 
-class GenerativeRecs(nn.Module):
+class T5(nn.Module):
     """
     Full transformer used by the paper
 
@@ -286,6 +361,7 @@ class GenerativeRecs(nn.Module):
                 dropout: float = 0.1,
                 ) -> None:
         super().__init__()
+        self.tok_embed = nn.Embedding(vocab_size, embed_dim)
 
         self.encoder = Encoder(vocab_size=vocab_size,
                                embed_dim=embed_dim,
@@ -305,15 +381,18 @@ class GenerativeRecs(nn.Module):
         
         self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False) # to logits
 
-    def forward(self, src, trg,) -> Tensor:
-        pass
+    def forward(self, src, target, mask=None, context_mask=None) -> Tensor:
+        xs = self.tok_embed(src, mask=mask)
+        x = self.encoder(target, src, mask=mask, context_mask=context_mask)
+
+        x = self.lm_head(x)
+        return x
+
 
 
 
 if __name__ == "__main__":
-    ### testing
-    # mlp = MLP(5, 10, 0.1)
-    # input = torch.tensor([0.4, 0.7, -0.8, -0.1, 0.15])
-    # print(mlp(input))
     
-    transformer = GenerativeRecs(1024, 768, 4, 12, 64, 1028, 4, 12, 64, 1028, 0.1)
+    transformer = T5(1024, 768, 4, 12, 64, 1028, 4, 12, 64, 1028, 0.1)
+    pytorch_total_params = sum(p.numel() for p in transformer.parameters())
+    print(pytorch_total_params)
