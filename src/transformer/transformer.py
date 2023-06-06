@@ -115,9 +115,11 @@ class SelfAttention(nn.Module):
         B, T, C = x.size()
 
         def _reshape(xs):
+            #reshape input for to be used for multihead attention
             return xs.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
 
-        def _unshape(self, xs):
+        def _unshape(xs):
+            #unshape multi-head attention output
             return xs.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         q = _reshape(self.query(x))
@@ -125,25 +127,26 @@ class SelfAttention(nn.Module):
         v = _reshape(self.value(x))
 
 
-        q = q * self.dim_head**-0.5
+        q = q * self.dim_head**-0.5 
 
-        score = torch.einsum('b h i d, b h j d -> b h i j', q, k)
+        score = torch.einsum('b h i d, b h j d -> b h i j', q, k) # compute similarity socres
 
-        score = self.rel_pos_bias(score)
+        # score = self.rel_pos_bias(score)
 
         mask_value = -torch.finfo(score.dtype).max
 
+        # mask some values to -infinity
         if mask is not None:
             score = score.masked_fill_(~mask, mask_value)
+        
 
 
         attn = F.softmax(score, dim=-1)
         attn = self.dropout(attn)
 
-        # aggregate
-
+        # outputs
         y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = _reshape(y) # re-assemble all head outputs side by side
+        y = _unshape(y) # re-assemble all head outputs side by side
 
         return self.proj_out(y) # project back to output embedding dim
 
@@ -188,11 +191,14 @@ class CrossAttention(nn.Module):
             past_key_value_states = context
 
         def _reshape(xs):
+            #reshape input for to be used for multihead attention
             return xs.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
 
-        def _unshape(self, xs):
+        def _unshape(xs):
+            #unshape multi-head attention output
             return xs.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+        
+    
         q = _reshape(self.query(x))
         k = _reshape(self.key(x))
         v = _reshape(self.value(x))
@@ -200,23 +206,23 @@ class CrossAttention(nn.Module):
 
         q = q * self.dim_head**-0.5
 
-        score = torch.einsum('b h i d, b h j d -> b h i j', q, k)
+        score = torch.einsum('b h i d, b h j d -> b h i j', q, k)  # compute similarity socres
+
 
         mask_value = -torch.finfo(score.dtype).max
-
+        #mask some vals to -infinity
         if mask is not None:
             score = score.masked_fill_(~mask, mask_value)
-
+        
         if context_mask is not None:
             score = score.masked_fill_(~context_mask[:, None, :], mask_value)
 
         attn = F.softmax(score, dim=-1)
         attn = self.dropout(attn)
 
-        # aggregate
-
+        #outputs
         y = attn @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = _reshape(y) # re-assemble all head outputs side by side
+        y = _unshape(y) # re-assemble all head outputs side by side
 
         return self.proj_out(y) # project back to output embedding dim
 
